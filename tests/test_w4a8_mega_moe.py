@@ -15,7 +15,7 @@ import time
 import torch
 import torch.distributed as dist
 
-from deepgemm import m_grouped_w4a8_gemm_nt_contiguous_hipc as reference_gemm
+from deepgemm import m_grouped_w4a8_gemm_nt_contiguous_hipc as _reference_gemm
 from deepgemm import pack_w4a8_moe_hipc_weight
 from deepgemm.group_gemm_weight_pack import pack_w4a8_weight_k_contiguous
 from lightop import fuse_silu_mul_clamp_quant
@@ -24,6 +24,13 @@ from lightop.quant import per_token_quant_int8
 from lightop.moe import ep_gather
 from megamoe import SymmBuffer, get_symm_buffer_for_mega_moe
 from megamoe.w4a8 import grouped_gemm, w4a8_mega_moe, _stage_w4a8_inputs
+
+
+def reference_gemm(x, weight, out, indices):
+    # The installed HIPC reference decodes signed INT4 into its high nibble
+    # (q * 16); MegaMoE uses q directly with true per-channel scales.
+    # SGLang converts loader scales in the inverse direction at model load.
+    return _reference_gemm(x, (weight[0], weight[1] / 16.0), out, indices)
 
 
 def packed_weight(e, n, k):
@@ -193,9 +200,11 @@ def test_distributed(args):
                     benchmark_reference = ref.clone()
                 if (clamp is not None and os.environ.get("MEGAMOE_W4A8_DEVICE_ROWS", "1") == "1"
                         and hasattr(buf, "_w4a8_active_rows")):
-                    needed = buf._w4a8_active_rows
+                    needed = int(buf._w4a8_active_rows.item())
                     allocated = buf._w4a8_workspace[0][0]
-                    assert needed <= allocated <= max(64, 2 * needed), (needed, allocated)
+                    bound = 8 * buf.num_max_tokens_per_rank * args.topk + e * 63
+                    assert needed <= allocated <= ((bound + 63) // 64) * 64, (needed, allocated)
+                    assert buf._w4a8_workspace_allocations == 1
                 mismatch = (y != ref).sum()
                 if mismatch.item():
                     delta = (y.float() - ref.float()).abs()

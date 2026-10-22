@@ -125,48 +125,39 @@ def w4a8_mega_moe(y, l1_weights, l2_weights, sym_buffer,
     rank_barrier(p, rank_idx=rank, num_ranks=ranks, graph_max_tokens=tokens)
     offsets = w4a8_ext.count_routes(p.buffer, *args, alignment)
     device_rows = activation_clamp is not None and os.environ.get("MEGAMOE_W4A8_DEVICE_ROWS", "1") == "1"
-    if device_rows:
-        active_rows = int(offsets[-1].item())
-        p._w4a8_active_rows = active_rows
-        cached = getattr(p, "_w4a8_workspace", None)
-        if (cached is not None and cached[0][1:] == (hidden, intermediate)
-                and active_rows <= cached[0][0] <= max(alignment, 2 * active_rows)
-                and cached[0][0] % alignment == 0):
-            rows = cached[0][0]
-        else:
-            quantum = max(alignment, ((active_rows + 8 * alignment - 1)
-                                       // (8 * alignment)) * alignment)
-            rows = ((active_rows + quantum - 1) // quantum) * quantum
-        key = (rows, hidden, intermediate)
-        if cached is None or cached[0] != key:
-            # Release stale oversized buffers before allocating their replacement.
-            p._w4a8_workspace = None
-            cached = None
-            routes = torch.empty(rows, dtype=torch.int32, device=y.device)
-            indices = torch.empty_like(routes)
-            x = torch.empty((rows, hidden), dtype=torch.int8, device=y.device)
-            scale = torch.empty(rows, dtype=torch.float32, device=y.device)
-            gate_up = torch.empty((rows, 2 * intermediate), dtype=torch.bfloat16, device=y.device)
-            act = torch.empty((rows, intermediate), dtype=torch.int8, device=y.device)
-            act_scale = torch.empty((rows, 1), dtype=torch.float32, device=y.device)
-            down = torch.empty((rows, hidden), dtype=torch.bfloat16, device=y.device)
-            cached = (key, routes, indices, x, scale, gate_up, act, act_scale, down)
-            p._w4a8_workspace = cached
-            p._w4a8_workspace_allocations = getattr(p, "_w4a8_workspace_allocations", 0) + 1
-            logger.info("W4A8 workspace rank=%d rows=%d active_rows=%s bytes=%d",
-                        rank, rows, active_rows, rows * (3 * hidden + 5 * intermediate + 16))
-        _, routes, indices, x, scale, gate_up, act, act_scale, down = cached
-    else:
-        rows = int(offsets[-1].item())
+    # Each peer contributes at most capacity * topk route entries. Rounding
+    # each local expert count up costs at most alignment - 1 extra rows.
+    # This bound covers skewed, ragged and empty ranks without a GPU-to-host
+    # read. Keep actual row counts on-device for gather and activation.
+    max_routes = ranks * p.num_max_tokens_per_rank * p.num_topk
+    rows = ((max_routes + local_experts * (alignment - 1) + alignment - 1)
+            // alignment) * alignment
+    p._w4a8_active_rows = offsets[-1:]
+    key = (rows, hidden, intermediate)
+    cached = getattr(p, "_w4a8_workspace", None)
+    if cached is None or cached[0] != key:
+        p._w4a8_workspace = None
+        cached = None
         routes = torch.empty(rows, dtype=torch.int32, device=y.device)
         indices = torch.empty_like(routes)
         x = torch.empty((rows, hidden), dtype=torch.int8, device=y.device)
         scale = torch.empty(rows, dtype=torch.float32, device=y.device)
+        gate_up = torch.empty((rows, 2 * intermediate), dtype=torch.bfloat16, device=y.device)
+        act = torch.empty((rows, intermediate), dtype=torch.int8, device=y.device)
+        act_scale = torch.empty((rows, 1), dtype=torch.float32, device=y.device)
+        down = torch.empty((rows, hidden), dtype=torch.bfloat16, device=y.device)
+        cached = (key, routes, indices, x, scale, gate_up, act, act_scale, down)
+        p._w4a8_workspace = cached
+        p._w4a8_workspace_allocations = getattr(p, "_w4a8_workspace_allocations", 0) + 1
+        if os.environ.get("MEGAMOE_ENABLE_LOGGING", "0") == "1":
+            logger.info("W4A8 workspace rank=%d capacity_rows=%d bytes=%d",
+                        rank, rows, rows * (3 * hidden + 5 * intermediate + 16))
+    _, routes, indices, x, scale, gate_up, act, act_scale, down = cached
     w4a8_ext.gather_routes(p.buffer, offsets, routes, indices, x, scale, *args,
                            device_rows, inverse, route_weights)
     if rows:
         if not device_rows:
-            gate_up = torch.zeros((rows, 2 * intermediate), dtype=torch.bfloat16, device=y.device)
+            gate_up.zero_()
         grouped_gemm((x, scale), l1_weights, gate_up, indices, block_m=block_m1, n_loop=n_loop1)
         # Match the framework reference's BF16 activation and INT8 rounding.
         from lightop import fuse_silu_mul_clamp_quant
@@ -181,8 +172,6 @@ def w4a8_mega_moe(y, l1_weights, l2_weights, sym_buffer,
             act, act_scale = fuse_silu_mul_quant(gate_up)
         else:
             act, act_scale = fuse_silu_mul_clamp_quant(gate_up, float(activation_clamp))
-        if not device_rows:
-            down = torch.empty((rows, hidden), dtype=torch.bfloat16, device=y.device)
         grouped_gemm((act, act_scale), l2_weights, down, indices, block_m=block_m2, n_loop=n_loop2)
         if rank_partials:
             w4a8_ext.scatter_rank_partials(p.buffer, inverse, route_weights, down, *args)
