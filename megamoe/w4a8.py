@@ -74,7 +74,8 @@ def _check_weights(weights, experts, n, k, device):
 
 def w4a8_mega_moe(y, l1_weights, l2_weights, sym_buffer,
                   cumulative_local_expert_recv_stats=None, *, activation_clamp=None,
-                  combine_group_map=None, gemm_config=None):
+                  combine_group_map=None, gemm_config=None, activation="silu",
+                  max_routes_per_token_per_rank=None):
     """Consume staged INT8 inputs and physical expert IDs in ``sym_buffer``.
 
     Weights use DeepGEMM's HIPC N32 packing and true per-channel scales.
@@ -82,7 +83,15 @@ def w4a8_mega_moe(y, l1_weights, l2_weights, sym_buffer,
     All ranks must call, including ranks with no local input tokens.
     ``combine_group_map`` maps physical experts to their canonical EP rank
     for the two-level BF16 reduction, preserving baseline rounding under EPLB.
+    ``activation='gelu'`` preserves Spark's BF16 GELU/mul/clamp/INT8 rounding
+    with LightOp; the default SwiGLU path is unchanged.
+    ``max_routes_per_token_per_rank`` is a proven routing bound, not an
+    expected load. The default retains the unrestricted top-k capacity.
     """
+    if activation not in ("silu", "gelu"):
+        raise ValueError("W4A8 activation must be 'silu' or 'gelu'")
+    if activation == "gelu" and activation_clamp is None:
+        raise ValueError("Spark GELU quantization requires an activation clamp")
     if sym_buffer.quant_mode != "w4a8":
         raise ValueError("W4A8 requires SymmBuffer(quant_mode='w4a8')")
     if torch.cuda.is_current_stream_capturing():
@@ -106,11 +115,13 @@ def w4a8_mega_moe(y, l1_weights, l2_weights, sym_buffer,
     if cumulative_local_expert_recv_stats is not None:
         raise NotImplementedError("Use SGLang's logical expert distribution recorder for offline EPLB")
     args = (ranks, p.num_experts, p.num_max_tokens_per_rank, p.num_topk, hidden, rank)
-    rank_partials = (p.num_topk == 6 and combine_group_map is None and
+    fast_topk = (p.num_topk == 6 or
+                p.num_topk == 14 and os.environ.get("MEGAMOE_W4A8_TOP14_FASTPATH", "1") == "1")
+    rank_partials = (fast_topk and combine_group_map is None and
                      os.environ.get("MEGAMOE_W4A8_RANK_PARTIALS", "1") == "1")
     inverse = None
     route_weights = None
-    mapped_gather = (p.num_topk == 6 and activation_clamp is not None
+    mapped_gather = (fast_topk and activation_clamp is not None
                      and os.environ.get("MEGAMOE_W4A8_DEVICE_ROWS", "1") == "1")
     if rank_partials or mapped_gather:
         if not hasattr(p, "_w4a8_inverse"):
@@ -129,9 +140,15 @@ def w4a8_mega_moe(y, l1_weights, l2_weights, sym_buffer,
     # each local expert count up costs at most alignment - 1 extra rows.
     # This bound covers skewed, ragged and empty ranks without a GPU-to-host
     # read. Keep actual row counts on-device for gather and activation.
-    max_routes = ranks * p.num_max_tokens_per_rank * p.num_topk
+    route_bound = (p.num_topk if max_routes_per_token_per_rank is None
+                   else max_routes_per_token_per_rank)
+    if type(route_bound) is not int or not 1 <= route_bound <= p.num_topk:
+        raise ValueError("invalid per-token per-rank route bound")
+    max_routes = ranks * p.num_max_tokens_per_rank * route_bound
     rows = ((max_routes + local_experts * (alignment - 1) + alignment - 1)
             // alignment) * alignment
+    if route_bound < p.num_topk:
+        torch._assert_async(offsets[-1] <= rows, "W4A8 route workspace capacity exceeded")
     p._w4a8_active_rows = offsets[-1:]
     key = (rows, hidden, intermediate)
     cached = getattr(p, "_w4a8_workspace", None)
@@ -142,16 +159,20 @@ def w4a8_mega_moe(y, l1_weights, l2_weights, sym_buffer,
         indices = torch.empty_like(routes)
         x = torch.empty((rows, hidden), dtype=torch.int8, device=y.device)
         scale = torch.empty(rows, dtype=torch.float32, device=y.device)
-        gate_up = torch.empty((rows, 2 * intermediate), dtype=torch.bfloat16, device=y.device)
+        # Activation consumes gate/up before GEMM2 writes down, on this
+        # stream. Share storage without changing either GEMM or its layout.
+        shared_output = torch.empty(rows * max(hidden, 2 * intermediate),
+                                    dtype=torch.bfloat16, device=y.device)
+        gate_up = shared_output[:rows * 2 * intermediate].view(rows, 2 * intermediate)
         act = torch.empty((rows, intermediate), dtype=torch.int8, device=y.device)
         act_scale = torch.empty((rows, 1), dtype=torch.float32, device=y.device)
-        down = torch.empty((rows, hidden), dtype=torch.bfloat16, device=y.device)
+        down = shared_output[:rows * hidden].view(rows, hidden)
         cached = (key, routes, indices, x, scale, gate_up, act, act_scale, down)
         p._w4a8_workspace = cached
         p._w4a8_workspace_allocations = getattr(p, "_w4a8_workspace_allocations", 0) + 1
         if os.environ.get("MEGAMOE_ENABLE_LOGGING", "0") == "1":
             logger.info("W4A8 workspace rank=%d capacity_rows=%d bytes=%d",
-                        rank, rows, rows * (3 * hidden + 5 * intermediate + 16))
+                        rank, rows, rows * (hidden + intermediate + 16 + 2 * max(hidden, 2 * intermediate)))
     _, routes, indices, x, scale, gate_up, act, act_scale, down = cached
     w4a8_ext.gather_routes(p.buffer, offsets, routes, indices, x, scale, *args,
                            device_rows, inverse, route_weights)
@@ -163,15 +184,24 @@ def w4a8_mega_moe(y, l1_weights, l2_weights, sym_buffer,
         from lightop import fuse_silu_mul_clamp_quant
         from lightop.activation import fuse_silu_mul_quant
 
+        activation_options = {}
+        if activation == "gelu":
+            smooth = getattr(p, "_w4a8_identity_smooth", None)
+            if smooth is None:
+                smooth = p._w4a8_identity_smooth = torch.ones(
+                    intermediate, dtype=torch.float32, device=y.device)
+            activation_options = dict(use_gelu=True, smooth_scale=smooth)
         if device_rows:
             from lightop import fuse_silu_mul_clamp_quant_ep
             fuse_silu_mul_clamp_quant_ep(
                 gate_up.unsqueeze(0), float(activation_clamp), offsets[-1:],
-                expect_m=min(rows, 4096), output=act.unsqueeze(0), scales=act_scale.unsqueeze(0))
+                expect_m=min(rows, 4096), output=act.unsqueeze(0), scales=act_scale.unsqueeze(0),
+                **activation_options)
         elif activation_clamp is None:
             act, act_scale = fuse_silu_mul_quant(gate_up)
         else:
-            act, act_scale = fuse_silu_mul_clamp_quant(gate_up, float(activation_clamp))
+            act, act_scale = fuse_silu_mul_clamp_quant(
+                gate_up, float(activation_clamp), **activation_options)
         grouped_gemm((act, act_scale), l2_weights, down, indices, block_m=block_m2, n_loop=n_loop2)
         if rank_partials:
             w4a8_ext.scatter_rank_partials(p.buffer, inverse, route_weights, down, *args)

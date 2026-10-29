@@ -238,6 +238,47 @@ __global__ void combine_topk6_kernel(uint8_t* sym, RouteLayout p, const int* gro
     reinterpret_cast<uint4*>(y)[int64_t(token) * vectors_per_row + column] = output.vector;
 }
 
+// Each owner wrote one BF16 partial. Keep the original owner-order FP32
+// reduction, including the rounding between local gather and EP reduction.
+__global__ void combine_topk14_rank_partials_kernel(
+    uint8_t* sym, RouteLayout p, hip_bfloat16* y) {
+    asm volatile("buffer_wbinvl1_vol\n" ::: "memory");
+    const int token = blockIdx.y;
+    const int column = blockIdx.x * blockDim.x + threadIdx.x;
+    const int vectors_per_row = p.hidden / 8;
+    if (column >= vectors_per_row) return;
+    const auto* ids = reinterpret_cast<const int64_t*>(sym + p.ids_offset()) +
+                      token * 14;
+    const auto* input = reinterpret_cast<const uint4*>(sym + p.combine_offset());
+    unsigned owners = 0;
+    #pragma unroll
+    for (int slot = 0; slot < 14; ++slot) {
+        const int64_t expert = ids[slot];
+        if (expert >= 0 && expert < p.experts) {
+            owners |= 1u << (int(expert) / (p.experts / 8));
+        }
+    }
+    float total[8] = {};
+    for (int owner = 0; owner < 8; ++owner) {
+        if (!(owners & (1u << owner))) continue;
+        union Pack { uint4 vector; uint16_t bits[8]; } value;
+        value.vector = input[(int64_t(owner) * p.capacity + token) *
+                             vectors_per_row + column];
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            total[i] += bf16_bits_to_float(value.bits[i]);
+        }
+    }
+    union Pack { uint4 vector; uint16_t bits[8]; } output;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        output.bits[i] = float_to_bf16_bits(total[i]);
+    }
+    reinterpret_cast<uint4*>(y)[int64_t(token) * vectors_per_row + column] =
+        output.vector;
+}
+
+template<int TopK>
 __global__ void scatter_rank_partials_kernel(uint8_t* sym, RouteLayout p,
                                              const int* inverse, const float* route_weights,
                                              const uint4* down) {
@@ -246,10 +287,10 @@ __global__ void scatter_rank_partials_kernel(uint8_t* sym, RouteLayout p,
     const int source = (blockIdx.x + p.rank) & 7;
     const int token = blockIdx.x >> 3;
     auto* peer = dcu_peer_sym_buffer_ptrs(sym)[source];
-    const int task_base = (source * p.capacity + token) * 6;
+    const int task_base = (source * p.capacity + token) * TopK;
     unsigned slot_mask = 0;
     #pragma unroll
-    for (int slot = 0; slot < 6; ++slot) {
+    for (int slot = 0; slot < TopK; ++slot) {
         if (inverse[task_base + slot] >= 0) slot_mask |= 1u << slot;
     }
     if (!slot_mask) return;
@@ -394,15 +435,21 @@ void combine_routes(torch::Tensor sym, const std::optional<torch::Tensor>& group
     }
     const int vectors = y.size(0) * hidden / 8;
     if (rank_partials) {
-        TORCH_CHECK(topk == 6 && !group_map.has_value(), "rank partials require topk6 and canonical physical groups");
+        TORCH_CHECK((topk == 6 || topk == 14) && !group_map.has_value(),
+                    "rank partials require topk6/14 and canonical physical groups");
         TORCH_CHECK(sym.numel() >= combine_token_offset(ranks, experts, capacity, topk, hidden) +
                     int64_t(ranks) * capacity * hidden * 2, "rank partial buffer is too small");
     }
     if (vectors) {
         if (rank_partials) {
             const dim3 grid((hidden / 8 + 127) / 128, y.size(0));
-            combine_topk6_kernel<true><<<grid, 128, 0, at::cuda::getCurrentHIPStream()>>>(
-                (uint8_t*)sym.data_ptr(), p, nullptr, (hip_bfloat16*)y.data_ptr());
+            if (topk == 14) {
+                combine_topk14_rank_partials_kernel<<<grid, 128, 0, at::cuda::getCurrentHIPStream()>>>(
+                    (uint8_t*)sym.data_ptr(), p, (hip_bfloat16*)y.data_ptr());
+            } else {
+                combine_topk6_kernel<true><<<grid, 128, 0, at::cuda::getCurrentHIPStream()>>>(
+                    (uint8_t*)sym.data_ptr(), p, nullptr, (hip_bfloat16*)y.data_ptr());
+            }
         } else if (compact && topk == 6) {
             const dim3 grid((hidden / 8 + 127) / 128, y.size(0));
             combine_topk6_kernel<false><<<grid, 128, 0, at::cuda::getCurrentHIPStream()>>>(
@@ -423,14 +470,20 @@ void scatter_rank_partials(torch::Tensor sym, torch::Tensor inverse,
     check_tensor(inverse, sym, at::kInt, "inverse");
     check_tensor(route_weights, sym, at::kFloat, "route_weights");
     check_tensor(down, sym, at::kBFloat16, "down");
-    TORCH_CHECK(topk == 6 && inverse.numel() == int64_t(ranks) * capacity * topk &&
+    TORCH_CHECK((topk == 6 || topk == 14) && inverse.numel() == int64_t(ranks) * capacity * topk &&
                 route_weights.numel() == inverse.numel() &&
                 down.dim() == 2 && down.size(1) == hidden, "invalid rank-partial shape");
     TORCH_CHECK(sym.numel() >= combine_token_offset(ranks, experts, capacity, topk, hidden) +
                 int64_t(ranks) * capacity * hidden * 2, "rank partial buffer is too small");
-    scatter_rank_partials_kernel<<<ranks * capacity, 256, 0, at::cuda::getCurrentHIPStream()>>>(
-        (uint8_t*)sym.data_ptr(), p, inverse.data_ptr<int>(), route_weights.data_ptr<float>(),
-        (const uint4*)down.data_ptr());
+    if (topk == 14) {
+        scatter_rank_partials_kernel<14><<<ranks * capacity, 256, 0, at::cuda::getCurrentHIPStream()>>>(
+            (uint8_t*)sym.data_ptr(), p, inverse.data_ptr<int>(), route_weights.data_ptr<float>(),
+            (const uint4*)down.data_ptr());
+    } else {
+        scatter_rank_partials_kernel<6><<<ranks * capacity, 256, 0, at::cuda::getCurrentHIPStream()>>>(
+            (uint8_t*)sym.data_ptr(), p, inverse.data_ptr<int>(), route_weights.data_ptr<float>(),
+            (const uint4*)down.data_ptr());
+    }
     TORCH_CHECK(hipGetLastError() == hipSuccess, "W4A8 rank-partial scatter launch failed");
 }
 }
