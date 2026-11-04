@@ -6,6 +6,11 @@ import os
 import torch
 
 from .dcu_megamoe_opt import w4a8_ext
+
+try:
+    from .dcu_megamoe_opt import w4a8_route_ext
+except ImportError:
+    w4a8_route_ext = None
 from .dcu_megamoe_opt.K3_fused.k3_fused import rank_barrier
 
 logger = logging.getLogger(__name__)
@@ -75,7 +80,8 @@ def _check_weights(weights, experts, n, k, device):
 def w4a8_mega_moe(y, l1_weights, l2_weights, sym_buffer,
                   cumulative_local_expert_recv_stats=None, *, activation_clamp=None,
                   combine_group_map=None, gemm_config=None, activation="silu",
-                  max_routes_per_token_per_rank=None):
+                  max_routes_per_token_per_rank=None, max_dispatch_tokens=None,
+                  max_peer_tokens=None):
     """Consume staged INT8 inputs and physical expert IDs in ``sym_buffer``.
 
     Weights use DeepGEMM's HIPC N32 packing and true per-channel scales.
@@ -147,8 +153,23 @@ def w4a8_mega_moe(y, l1_weights, l2_weights, sym_buffer,
     max_routes = ranks * p.num_max_tokens_per_rank * route_bound
     rows = ((max_routes + local_experts * (alignment - 1) + alignment - 1)
             // alignment) * alignment
-    if route_bound < p.num_topk:
-        torch._assert_async(offsets[-1] <= rows, "W4A8 route workspace capacity exceeded")
+    launch_rows = rows
+    launch_capacity = p.num_max_tokens_per_rank
+    if max_peer_tokens is not None:
+        if (type(max_peer_tokens) is not int or not tokens <= max_peer_tokens <= launch_capacity
+                or max_peer_tokens <= 0 or max_dispatch_tokens != ranks * max_peer_tokens
+                or not device_rows or not rank_partials):
+            raise ValueError("invalid W4A8 peer token bound")
+        if w4a8_route_ext is not None:
+            launch_capacity = max_peer_tokens
+    if max_dispatch_tokens is not None:
+        if (type(max_dispatch_tokens) is not int or not tokens <= max_dispatch_tokens <= ranks * p.num_max_tokens_per_rank
+                or not device_rows or not rank_partials or gemm_config != ((64, 4), (64, 4))):
+            raise ValueError("invalid bounded W4A8 launch contract")
+        launch_rows = ((max_dispatch_tokens * route_bound + local_experts * (alignment - 1) + alignment - 1)
+                       // alignment) * alignment
+    if route_bound < p.num_topk or launch_rows < rows:
+        torch._assert_async(offsets[-1] <= launch_rows, "W4A8 route workspace capacity exceeded")
     p._w4a8_active_rows = offsets[-1:]
     key = (rows, hidden, intermediate)
     cached = getattr(p, "_w4a8_workspace", None)
@@ -174,12 +195,20 @@ def w4a8_mega_moe(y, l1_weights, l2_weights, sym_buffer,
             logger.info("W4A8 workspace rank=%d capacity_rows=%d bytes=%d",
                         rank, rows, rows * (hidden + intermediate + 16 + 2 * max(hidden, 2 * intermediate)))
     _, routes, indices, x, scale, gate_up, act, act_scale, down = cached
-    w4a8_ext.gather_routes(p.buffer, offsets, routes, indices, x, scale, *args,
-                           device_rows, inverse, route_weights)
+    if launch_capacity < p.num_max_tokens_per_rank:
+        w4a8_route_ext.gather_routes(p.buffer, offsets, routes, indices, x, scale, *args,
+                                    device_rows, inverse, route_weights, launch_capacity)
+    else:
+        w4a8_ext.gather_routes(p.buffer, offsets, routes, indices, x, scale, *args,
+                               device_rows, inverse, route_weights)
     if rows:
         if not device_rows:
             gate_up.zero_()
-        grouped_gemm((x, scale), l1_weights, gate_up, indices, block_m=block_m1, n_loop=n_loop1)
+        if launch_rows < rows:
+            launch_indices = indices[:launch_rows]
+            grouped_gemm((x[:launch_rows], scale[:launch_rows]), l1_weights, gate_up[:launch_rows], launch_indices, block_m=block_m1, n_loop=n_loop1)
+        else:
+            grouped_gemm((x, scale), l1_weights, gate_up, indices, block_m=block_m1, n_loop=n_loop1)
         # Match the framework reference's BF16 activation and INT8 rounding.
         from lightop import fuse_silu_mul_clamp_quant
         from lightop.activation import fuse_silu_mul_quant
@@ -202,9 +231,16 @@ def w4a8_mega_moe(y, l1_weights, l2_weights, sym_buffer,
         else:
             act, act_scale = fuse_silu_mul_clamp_quant(
                 gate_up, float(activation_clamp), **activation_options)
-        grouped_gemm((act, act_scale), l2_weights, down, indices, block_m=block_m2, n_loop=n_loop2)
+        if launch_rows < rows:
+            grouped_gemm((act[:launch_rows], act_scale[:launch_rows]), l2_weights, down[:launch_rows], launch_indices, block_m=block_m2, n_loop=n_loop2)
+        else:
+            grouped_gemm((act, act_scale), l2_weights, down, indices, block_m=block_m2, n_loop=n_loop2)
         if rank_partials:
-            w4a8_ext.scatter_rank_partials(p.buffer, inverse, route_weights, down, *args)
+            if launch_capacity < p.num_max_tokens_per_rank:
+                w4a8_route_ext.scatter_rank_partials(
+                    p.buffer, inverse, route_weights, down, *args, launch_capacity)
+            else:
+                w4a8_ext.scatter_rank_partials(p.buffer, inverse, route_weights, down, *args)
         else:
             w4a8_ext.scatter_routes(p.buffer, routes, down, *args,
                                    os.environ.get("MEGAMOE_W4A8_VECTOR_SCATTER", "1") == "1")

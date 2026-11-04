@@ -358,7 +358,7 @@ void gather_routes(torch::Tensor sym, torch::Tensor offsets, torch::Tensor route
                    torch::Tensor indices, torch::Tensor x, torch::Tensor scales,
                    int ranks, int experts, int capacity, int topk, int hidden, int rank,
                    bool device_rows, const std::optional<torch::Tensor>& inverse,
-                   const std::optional<torch::Tensor>& route_weights) {
+                   const std::optional<torch::Tensor>& route_weights, int launch_capacity = -1) {
     const c10::cuda::CUDAGuard guard(sym.device());
     const auto p = layout(sym, ranks, experts, capacity, topk, hidden, rank);
     for (auto t : {offsets, routes, indices}) check_tensor(t, sym, at::kInt, "route metadata");
@@ -387,8 +387,10 @@ void gather_routes(torch::Tensor sym, torch::Tensor offsets, torch::Tensor route
     routes_kernel<true><<<(ranks * capacity * topk + 255) / 256, 256, 0, stream>>>(
         (uint8_t*)sym.data_ptr(), p, counts.data_ptr<int>(), offsets.data_ptr<int>(),
         routes.data_ptr<int>(), indices.data_ptr<int>(), inverse_ptr, route_weights_ptr);
+    if (launch_capacity == -1) launch_capacity = capacity;
+    TORCH_CHECK(launch_capacity > 0 && launch_capacity <= capacity);
     if (rows && device_rows && inverse_ptr && topk <= 32) {
-        gather_tokens_kernel<<<ranks * capacity, 128, 0, stream>>>(
+        gather_tokens_kernel<<<ranks * launch_capacity, 128, 0, stream>>>(
             (uint8_t*)sym.data_ptr(), p, inverse_ptr,
             reinterpret_cast<int4*>(x.data_ptr<int8_t>()), scales.data_ptr<float>());
     } else if (rows) {
@@ -464,7 +466,7 @@ void combine_routes(torch::Tensor sym, const std::optional<torch::Tensor>& group
 
 void scatter_rank_partials(torch::Tensor sym, torch::Tensor inverse,
                            torch::Tensor route_weights, torch::Tensor down,
-                           int ranks, int experts, int capacity, int topk, int hidden, int rank) {
+                           int ranks, int experts, int capacity, int topk, int hidden, int rank, int launch_capacity = -1) {
     const c10::cuda::CUDAGuard guard(sym.device());
     const auto p = layout(sym, ranks, experts, capacity, topk, hidden, rank);
     check_tensor(inverse, sym, at::kInt, "inverse");
@@ -475,12 +477,14 @@ void scatter_rank_partials(torch::Tensor sym, torch::Tensor inverse,
                 down.dim() == 2 && down.size(1) == hidden, "invalid rank-partial shape");
     TORCH_CHECK(sym.numel() >= combine_token_offset(ranks, experts, capacity, topk, hidden) +
                 int64_t(ranks) * capacity * hidden * 2, "rank partial buffer is too small");
+    if (launch_capacity == -1) launch_capacity = capacity;
+    TORCH_CHECK(launch_capacity > 0 && launch_capacity <= capacity);
     if (topk == 14) {
-        scatter_rank_partials_kernel<14><<<ranks * capacity, 256, 0, at::cuda::getCurrentHIPStream()>>>(
+        scatter_rank_partials_kernel<14><<<ranks * launch_capacity, 256, 0, at::cuda::getCurrentHIPStream()>>>(
             (uint8_t*)sym.data_ptr(), p, inverse.data_ptr<int>(), route_weights.data_ptr<float>(),
             (const uint4*)down.data_ptr());
     } else {
-        scatter_rank_partials_kernel<6><<<ranks * capacity, 256, 0, at::cuda::getCurrentHIPStream()>>>(
+        scatter_rank_partials_kernel<6><<<ranks * launch_capacity, 256, 0, at::cuda::getCurrentHIPStream()>>>(
             (uint8_t*)sym.data_ptr(), p, inverse.data_ptr<int>(), route_weights.data_ptr<float>(),
             (const uint4*)down.data_ptr());
     }
@@ -489,10 +493,26 @@ void scatter_rank_partials(torch::Tensor sym, torch::Tensor inverse,
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+#ifdef W4A8_ROUTE_ONLY
+    m.def("gather_routes", &gather_routes);
+    m.def("scatter_rank_partials", &scatter_rank_partials);
+#else
     m.def("gemm", &megamoe_w4a8::m_grouped_marlin_w4a8_gemm_nt_contiguous_hipc);
     m.def("count_routes", &count_routes);
-    m.def("gather_routes", &gather_routes);
+    m.def("gather_routes", [](torch::Tensor sym, torch::Tensor offsets, torch::Tensor routes,
+                            torch::Tensor indices, torch::Tensor x, torch::Tensor scale,
+                            int ranks, int experts, int capacity, int topk, int hidden, int rank,
+                            bool device_rows, const std::optional<torch::Tensor>& inverse,
+                            const std::optional<torch::Tensor>& route_weights) {
+        gather_routes(sym, offsets, routes, indices, x, scale, ranks, experts, capacity,
+                      topk, hidden, rank, device_rows, inverse, route_weights);
+    });
     m.def("scatter_routes", &scatter_routes);
-    m.def("scatter_rank_partials", &scatter_rank_partials);
+    m.def("scatter_rank_partials", [](torch::Tensor sym, torch::Tensor inverse,
+                                    torch::Tensor weights, torch::Tensor down,
+                                    int ranks, int experts, int capacity, int topk, int hidden, int rank) {
+        scatter_rank_partials(sym, inverse, weights, down, ranks, experts, capacity, topk, hidden, rank);
+    });
     m.def("combine_routes", &combine_routes);
+#endif
 }

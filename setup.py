@@ -189,6 +189,17 @@ def get_ext_modules():
                 extra_compile_args={'cxx': cxx_flags, 'nvcc': hipcc_flags + ['-DNDEBUG', '-mllvm', '-enable-num-vgprs-768=true']},
             ),
             CUDAExtension(
+                name='megamoe.dcu_megamoe_opt.w4a8_route_ext',
+                sources=[os.path.join(opt_root, 'csrc', 'kernels', 'w4a8_route.cu')],
+                include_dirs=build_include_dirs,
+                libraries=build_libraries,
+                library_dirs=build_library_dirs,
+                extra_compile_args={
+                    'cxx': cxx_flags,
+                    'nvcc': hipcc_flags + ['-DNDEBUG', '-DW4A8_ROUTE_ONLY', '-mllvm', '-enable-num-vgprs-512=true'],
+                },
+            ),
+            CUDAExtension(
                 name='megamoe.dcu_megamoe_opt.K1_fused.k1_fused_ext',
                 sources=[
                     os.path.join(opt_root, 'K1_fused', 'k1_fused_ext.cu'),
